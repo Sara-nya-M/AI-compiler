@@ -1,0 +1,203 @@
+// Pipeline Orchestrator
+// Runs all 5 stages in sequence and assembles the final AppConfig
+
+const { v4: uuidv4 } = require('uuid');
+const { extractIntent } = require('./stage1_intent');
+const { designSystem } = require('./stage2_design');
+const { generateSchemas } = require('./stage3_schema');
+const { refineSchemas } = require('./stage4_refine');
+const { validateAndRepair } = require('./stage5_validate');
+const { enhanceSchemaWithAI, isGeminiAvailable } = require('../services/geminiService');
+
+const PIPELINE_VERSION = '1.0.0';
+
+function buildBusinessLogic(intentSpec, blueprint) {
+  const featureFlags = {};
+  Object.entries(intentSpec.features).forEach(([feature, enabled]) => {
+    featureFlags[feature] = { enabled, description: `${feature} feature flag` };
+  });
+
+  const premiumGating = {};
+  if (intentSpec.features.payments) {
+    premiumGating.analytics = { requiresPlan: ['premium', 'enterprise'], fallback: 'Show upgrade prompt' };
+    premiumGating.export = { requiresPlan: ['basic', 'premium', 'enterprise'], fallback: 'Disable export button' };
+    premiumGating.apiAccess = { requiresPlan: ['enterprise'], fallback: 'Show contact sales CTA' };
+  }
+
+  return {
+    assumptions: intentSpec.assumptions,
+    featureFlags,
+    premiumGating,
+    workflows: blueprint.flows,
+    businessRules: [
+      { rule: 'Soft delete pattern', description: 'Use is_deleted flag instead of hard DELETE' },
+      { rule: 'Audit trail', description: 'All mutations logged with user_id, timestamp, action' },
+      { rule: 'Optimistic locking', description: 'Use updated_at for conflict detection on updates' }
+    ]
+  };
+}
+
+async function runPipeline(prompt, onStageUpdate = () => {}) {
+  const startTime = Date.now();
+  const runId = uuidv4();
+  const stageTimings = [];
+
+  const time = (label) => {
+    const t = Date.now();
+    stageTimings.push({ stage: label, ms: t - startTime });
+    return t;
+  };
+
+  try {
+    // === STAGE 1: Intent Extraction ===
+    onStageUpdate({ stage: 1, name: 'Intent Extraction', status: 'running', message: 'Parsing natural language input...' });
+    const s1Start = Date.now();
+    const intentSpec = extractIntent(prompt);
+    const s1Ms = Date.now() - s1Start;
+    onStageUpdate({
+      stage: 1, name: 'Intent Extraction', status: 'done',
+      message: `Detected: ${intentSpec.appType} app, ${intentSpec.entities.length} entities, ${intentSpec.roles.length} roles`,
+      data: intentSpec, ms: s1Ms
+    });
+    time('Stage 1');
+
+    // === STAGE 2: System Design ===
+    onStageUpdate({ stage: 2, name: 'System Design', status: 'running', message: 'Building entity graph and system blueprint...' });
+    const s2Start = Date.now();
+    const blueprint = designSystem(intentSpec);
+    const s2Ms = Date.now() - s2Start;
+    onStageUpdate({
+      stage: 2, name: 'System Design', status: 'done',
+      message: `Designed ${Object.keys(blueprint.entities).length} entities, ${blueprint.relations.length} relations, ${blueprint.flows.length} flows`,
+      data: blueprint, ms: s2Ms
+    });
+    time('Stage 2');
+
+    // === STAGE 3: Schema Generation ===
+    onStageUpdate({ stage: 3, name: 'Schema Generation', status: 'running', message: 'Generating UI, API, DB and Auth schemas...' });
+    const s3Start = Date.now();
+    const schemas = generateSchemas(blueprint);
+    const s3Ms = Date.now() - s3Start;
+    onStageUpdate({
+      stage: 3, name: 'Schema Generation', status: 'done',
+      message: `Generated ${schemas.ui.pages.length} pages, ${schemas.api.endpoints.length} endpoints, ${schemas.db.tables.length} tables`,
+      data: schemas, ms: s3Ms
+    });
+    time('Stage 3');
+
+    // === STAGE 4: Refinement ===
+    onStageUpdate({ stage: 4, name: 'Refinement', status: 'running', message: 'Cross-validating schemas and fixing inconsistencies...' });
+    const s4Start = Date.now();
+    const refined = refineSchemas(schemas);
+    const s4Ms = Date.now() - s4Start;
+    onStageUpdate({
+      stage: 4, name: 'Refinement', status: 'done',
+      message: `Found ${refined.refinementReport.issuesFound} issues, applied ${refined.refinementReport.issuesFixed} fixes`,
+      data: refined, ms: s4Ms
+    });
+    time('Stage 4');
+
+    // === STAGE 5: Validation + Repair ===
+    onStageUpdate({ stage: 5, name: 'Validation & Repair', status: 'running', message: 'Validating final config against schema contract...' });
+    const s5Start = Date.now();
+
+    const businessLogic = buildBusinessLogic(intentSpec, blueprint);
+
+    // Assemble full AppConfig for validation
+    const preValidationConfig = {
+      metadata: {
+        appName: intentSpec.appType.charAt(0).toUpperCase() + intentSpec.appType.slice(1) + ' App',
+        appType: intentSpec.appType,
+        version: '1.0.0',
+        generatedAt: new Date().toISOString(),
+        pipelineVersion: PIPELINE_VERSION,
+        description: `A ${intentSpec.appType} application generated by AI App Compiler from: "${prompt.slice(0, 100)}"`,
+        runId,
+        confidence: intentSpec.confidence,
+        isVague: intentSpec.isVague
+      },
+      ui: refined.ui,
+      api: refined.api,
+      db: refined.db,
+      auth: refined.auth,
+      businessLogic,
+      validation: { isValid: false, errors: [], warnings: [], repairAttempts: 0, crossLayerChecks: [] }
+    };
+
+    const { config: validatedConfig, validation } = validateAndRepair(preValidationConfig);
+    const s5Ms = Date.now() - s5Start;
+
+    onStageUpdate({
+      stage: 5, name: 'Validation & Repair', status: validation.isValid ? 'done' : 'warning',
+      message: validation.isValid
+        ? `Config valid! ${validation.warnings.length} warnings, ${validation.repairAttempts} repair attempts`
+        : `${validation.errors.length} unresolved errors after ${validation.repairAttempts} repair attempts`,
+      ms: s5Ms
+    });
+    time('Stage 5');
+
+    // Build final AppConfig
+    const finalConfig = {
+      ...validatedConfig,
+      validation: {
+        isValid: validation.isValid,
+        errors: validation.errors,
+        warnings: validation.warnings,
+        repairAttempts: validation.repairAttempts,
+        repairs: validation.repairs,
+        crossLayerChecks: validation.crossLayerChecks
+      }
+    };
+
+    // === AI Enhancement (if Gemini key is available) ===
+    let aiEnhancements = null;
+    if (isGeminiAvailable()) {
+      onStageUpdate({ stage: 0, name: 'AI Enhancement', status: 'running', message: 'Enhancing with Gemini AI insights...' });
+      try {
+        const aiResult = await enhanceSchemaWithAI(intentSpec, blueprint, schemas);
+        if (aiResult && aiResult.aiEnhancements) {
+          aiEnhancements = aiResult.aiEnhancements;
+          finalConfig.aiEnhancements = aiEnhancements;
+          onStageUpdate({ stage: 0, name: 'AI Enhancement', status: 'done', message: `AI added ${aiResult.aiEnhancements.keyFeatures?.length || 0} key features and recommendations` });
+        } else {
+          onStageUpdate({ stage: 0, name: 'AI Enhancement', status: 'warning', message: 'AI enhancement skipped: Empty or invalid AI response' });
+        }
+      } catch (e) {
+        onStageUpdate({ stage: 0, name: 'AI Enhancement', status: 'warning', message: 'AI enhancement skipped: ' + e.message });
+      }
+    }
+
+    const totalMs = Date.now() - startTime;
+
+    return {
+      success: true,
+      runId,
+      totalMs,
+      stageTimings,
+      config: finalConfig,
+      pipelineSummary: {
+        prompt: prompt.slice(0, 200),
+        appType: intentSpec.appType,
+        confidence: intentSpec.confidence,
+        isVague: intentSpec.isVague,
+        entitiesCount: Object.keys(blueprint.entities).length,
+        pagesCount: refined.ui.pages.length,
+        endpointsCount: refined.api.endpoints.length,
+        tablesCount: refined.db.tables.length,
+        rolesCount: refined.auth.roles.length,
+        isValid: validation.isValid,
+        aiEnhanced: !!aiEnhancements
+      }
+    };
+  } catch (error) {
+    return {
+      success: false,
+      runId,
+      totalMs: Date.now() - startTime,
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    };
+  }
+}
+
+module.exports = { runPipeline, PIPELINE_VERSION };
